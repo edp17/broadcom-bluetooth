@@ -165,6 +165,9 @@ int no2bytes = 0;
 int tosleep = 0;
 int baudrate = 0;
 int enable_fork = 0;
+/* Optional jfltexx BCM4335 UART and pre-patch settings. */
+int force_two_stop_bits = 0;
+int prepatch_fd = -1;
 
 struct termios termios;
 uchar buffer[1024];
@@ -404,6 +407,29 @@ parse_fork(char *optarg)
 	return(0);
 }
 
+/* Reuse the firmware-file validation without changing --patchram. */
+int
+parse_prepatch(char *optarg)
+{
+	int main_fw_fd = hcdfile_fd;
+	if (prepatch_fd >= 0) {
+		fprintf(stderr, "--prepatch specified more than once\n");
+		return(1);
+	}
+	parse_patchram(optarg);
+	prepatch_fd = hcdfile_fd;
+	hcdfile_fd = main_fw_fd;
+	return(0);
+}
+
+int
+parse_two_stop_bits(char *optarg)
+{
+	(void)optarg;
+	force_two_stop_bits = 1;
+	return(0);
+}
+
 void
 usage(char *argv0)
 {
@@ -447,6 +473,8 @@ usage(char *argv0)
 	printf("\t\tdo not generate these two bytes.>\n");
 	printf("\t<--tosleep=microseconds>\n");
 	printf("\t<--enable_fork it will fork the process once completed (usefull to run it in a script)>\n");
+	printf("\t<--prepatch prepatch_file.hcd> (loaded at 115200 before main patch)\n");
+	printf("\t<--two_stop_bits> (set CSTOPB / 8N2 UART framing)\n");
 	printf("\tuart_device_name\n");
 }
 
@@ -462,7 +490,7 @@ parse_cmd_line(int argc, char **argv)
 		parse_bdaddr, parse_enable_lpm, parse_enable_hci,
 		parse_use_baudrate_for_download,
 		parse_scopcm, parse_i2s, parse_no2bytes, parse_tosleep,
-		parse_fork};
+		parse_fork, parse_prepatch, parse_two_stop_bits};
 
 	while (1) {
 		int this_option_optind = optind ? optind : 1;
@@ -480,6 +508,8 @@ parse_cmd_line(int argc, char **argv)
 			{"no2bytes", 0, 0, 0},
 			{"tosleep", 1, 0, 0},
 			{"enable_fork", 0, 0, 0},
+			{"prepatch", 1, 0, 0},
+			{"two_stop_bits", 0, 0, 0},
 			{0, 0, 0, 0}
 		};
 
@@ -554,6 +584,8 @@ init_uart()
 #endif
 
 	termios.c_cflag |= CRTSCTS;
+	if (force_two_stop_bits)
+		termios.c_cflag |= CSTOPB;
 	tcsetattr(uart_fd, TCSANOW, &termios);
 	tcflush(uart_fd, TCIOFLUSH);
 	tcsetattr(uart_fd, TCSANOW, &termios);
@@ -641,32 +673,56 @@ proc_reset()
 	alarm(0);
 }
 
-void
-proc_patchram()
+/* A .hcd record is opcode (2), length (1), then payload (length). */
+static int
+read_hcd_exact(int fd, uchar *out, int length)
 {
-	int len;
+	int done = 0;
+	while (done < length) {
+		ssize_t n = read(fd, out + done, length - done);
+		if (n == 0)
+			return done;
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		done += n;
+	}
+	return done;
+}
+
+void
+proc_patchram(int firmware_fd, const char *stage)
+{
+	int len, n;
+
+	if (debug)
+		fprintf(stderr, "Loading %s HCD stage\n", stage);
 
 	hci_send_cmd(hci_download_minidriver, sizeof(hci_download_minidriver));
-
 	read_event(uart_fd, buffer);
 
-	if (!no2bytes) {
+	if (!no2bytes)
 		read(uart_fd, &buffer[0], 2);
-	}
-
-	if (tosleep) {
+	if (tosleep)
 		usleep(tosleep);
-	}
 
-	while (read(hcdfile_fd, &buffer[1], 3)) {
-		buffer[0] = 0x01;
-
+	for (;;) {
+		n = read_hcd_exact(firmware_fd, &buffer[1], 3);
+		if (n == 0)
+			break;
+		if (n != 3) {
+			fprintf(stderr, "%s HCD: bad record header (%d)\n", stage, n);
+			exit(6);
+		}
 		len = buffer[3];
-
-		read(hcdfile_fd, &buffer[4], len);
-
+		if (read_hcd_exact(firmware_fd, &buffer[4], len) != len) {
+			fprintf(stderr, "%s HCD: truncated record payload\n", stage);
+			exit(7);
+		}
+		buffer[0] = 0x01;
 		hci_send_cmd(buffer, len + 4);
-
 		read_event(uart_fd, buffer);
 	}
 
@@ -823,14 +879,26 @@ main (int argc, char **argv)
 
 	proc_reset();
 
+	/* JF-LTE optional early firmware stage. Its Launch RAM command is
+	 * completed and reset before the main stage starts. */
+	if (prepatch_fd >= 0) {
+		proc_patchram(prepatch_fd, "prepatch");
+		close(prepatch_fd);
+		prepatch_fd = -1;
+		/* FW_PATCH_SETTLEMENT_DELAY_MS from jf-common/vnd_jf.txt. */
+		usleep(200000);
+	}
+
 	if (use_baudrate_for_download) {
 		if (termios_baudrate) {
 			proc_baudrate();
 		}
 	}
 
-	if (hcdfile_fd > 0) {
-		proc_patchram();
+	if (hcdfile_fd >= 0) {
+		proc_patchram(hcdfile_fd, "main");
+		close(hcdfile_fd);
+		hcdfile_fd = -1;
 	}
 
 	if (termios_baudrate) {
