@@ -19,7 +19,7 @@ make
 
 %install
 rm -rf %{buildroot}
-%make_install
+make install INSTALL_ROOT=%{buildroot}
 
 %files
 %defattr(-,root,root,-)
